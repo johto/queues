@@ -593,7 +593,7 @@ func main() {
 		for ti, t := range tests {
 			var fastest int64 = -1
 			for i := 0; i < 3; i++ {
-				nsecs := runTest(method, t.numItems / 1000, t.numConnections)
+				nsecs := runTest(method, t.numItems, t.numConnections)
 				if fastest == -1 || nsecs < fastest {
 					fastest = nsecs
 				}
