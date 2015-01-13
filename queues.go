@@ -192,7 +192,7 @@ func advisoryLocksSingleTxn() initFunctionType {
 					-- maximum supported concurrency
 					LIMIT 128
 				) potential_items
-				WHERE pg_try_advisory_lock(itemid)
+				WHERE pg_try_advisory_xact_lock(itemid)
 				ORDER BY itemid
 				LIMIT 1
 			) AND
