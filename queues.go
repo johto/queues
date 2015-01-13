@@ -548,12 +548,31 @@ but a walking shadow.
 }
 
 func main() {
+	var vacuum bool
+
+	if len(os.Args) == 1 {
+		vacuum = true
+	} else if len(os.Args) == 2 {
+		switch os.Args[1] {
+		case "yes":
+			vacuum = true
+		case "no":
+			vacuum = false
+		default:
+			fmt.Fprintf(os.Stderr, "unrecognized boolean value %q\n", os.Args[1])
+			os.Exit(1)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Usage: %s [vacuum]\n", os.Args[0])
+		os.Exit(1)
+	}
+
 	tests := []struct{
 		numConnections int
 		numItems int
 	}{
 		{  1,	100000, },
-		{  2,	200000, },
+		{  2,	250000, },
 		{  4,	300000, },
 		{  6,   300000, },
 		{  8,	300000, },
@@ -593,7 +612,7 @@ func main() {
 		for ti, t := range tests {
 			var fastest int64 = -1
 			for i := 0; i < 3; i++ {
-				nsecs := runTest(method, t.numItems, t.numConnections)
+				nsecs := runTest(method, t.numItems, t.numConnections, vacuum)
 				if fastest == -1 || nsecs < fastest {
 					fastest = nsecs
 				}
@@ -616,7 +635,7 @@ func main() {
 	}
 }
 
-func runTest(method string, numItems int, numConnections int) int64 {
+func runTest(method string, numItems int, numConnections int, vacuum bool) int64 {
 	var initFunc initFunctionType
 
 	switch method {
@@ -681,6 +700,11 @@ func runTest(method string, numItems int, numConnections int) int64 {
 				}
 				b.set(itemid)
 				numItems++
+
+				_, err = conn.Exec("VACUUM items")
+				if err != nil {
+					panic(err)
+				}
 			}
 
 			dataChan <- b
