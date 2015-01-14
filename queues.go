@@ -9,9 +9,13 @@ import (
 	_ "github.com/lib/pq"
 	"math/rand"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+var numRaces int64
 
 type initFunctionType func(conn *sql.Conn) (exec func(conn *sql.Conn) int, err error)
 
@@ -106,8 +110,9 @@ func naiveUpdateSingleTxn() initFunctionType {
 	}
 }
 
-// Skip locked rows using advisory locks when grabbing an item
-func advisoryLocks() initFunctionType {
+// Skip locked rows using advisory locks when grabbing an item; random offset
+// to avoid races.
+func advisoryLocksRandomOffset(numConnections int) initFunctionType {
 	return func(conn *sql.Conn) (exec func(conn *sql.Conn) int, err error) {
 		grabstmt, err := conn.Prepare(`
 			UPDATE items
@@ -121,7 +126,79 @@ func advisoryLocks() initFunctionType {
 					WHERE grabbed IS NULL
 					ORDER BY itemid
 					-- maximum supported concurrency
-					LIMIT 128
+					OFFSET $1
+					LIMIT 32
+				) potential_items
+				WHERE pg_try_advisory_xact_lock(itemid)
+				ORDER BY itemid
+				LIMIT 1
+			) AND
+			grabbed IS NULL -- guard against the race
+			RETURNING itemid
+		`)
+		if err != nil {
+			return nil, err
+		}
+		racecheckstmt, err := conn.Prepare(`
+			SELECT EXISTS (SELECT 1 FROM items WHERE grabbed IS NULL ORDER BY itemid)
+		`)
+		if err != nil {
+			return nil, err
+		}
+		finishstmt, err := conn.Prepare(`
+			UPDATE items
+				SET processed = now()
+			WHERE itemid = $1
+		`)
+		if err != nil {
+			return nil, err
+		}
+
+		return func(conn *sql.Conn) int {
+			var itemid int
+
+		again:
+			err := grabstmt.QueryRow(rand.Intn(numConnections*2)).Scan(&itemid)
+			if err == sql.ErrNoRows {
+				var notDone bool
+				err = racecheckstmt.QueryRow().Scan(&notDone)
+				if err != nil {
+					panic(err)
+				}
+				if (notDone) {
+					atomic.AddInt64(&numRaces, 1)
+					goto again
+				}
+				return -1
+			} else if err != nil {
+				panic(err)
+			}
+			_, err = finishstmt.Exec(itemid)
+			if err != nil {
+				panic(err)
+			}
+			return itemid
+		}, err
+	}
+}
+
+// Skip locked rows using advisory locks when grabbing an item; naive version
+// with transaction-scoped locking.
+func advisoryLocksNaive() initFunctionType {
+	return func(conn *sql.Conn) (exec func(conn *sql.Conn) int, err error) {
+		grabstmt, err := conn.Prepare(`
+			UPDATE items
+				SET grabbed = now()
+			WHERE itemid = (
+				SELECT itemid
+				FROM
+				(
+					SELECT itemid
+					FROM items
+					WHERE grabbed IS NULL
+					ORDER BY itemid
+					-- maximum supported concurrency
+					LIMIT 32
 				) potential_items
 				WHERE pg_try_advisory_xact_lock(itemid)
 				ORDER BY itemid
@@ -160,6 +237,7 @@ func advisoryLocks() initFunctionType {
 					panic(err)
 				}
 				if (notDone) {
+					atomic.AddInt64(&numRaces, 1)
 					goto again
 				}
 				return -1
@@ -175,7 +253,173 @@ func advisoryLocks() initFunctionType {
 	}
 }
 
-// Skip locked rows using advisory locks when grabbing an item; single txn
+// Skip locked rows using advisory locks when grabbing an item, but hold the
+// lock for a while longer to try and minimize the number of races.  Batch
+// release version.
+func advisoryLocksBatchRelease() initFunctionType {
+	return func(conn *sql.Conn) (exec func(conn *sql.Conn) int, err error) {
+		grabstmt, err := conn.Prepare(`
+			UPDATE items
+				SET grabbed = now()
+			WHERE itemid = (
+				SELECT itemid
+				FROM
+				(
+					SELECT itemid
+					FROM items
+					WHERE grabbed IS NULL
+					ORDER BY itemid
+					-- maximum supported concurrency
+					LIMIT 32
+				) potential_items
+				WHERE pg_try_advisory_lock(itemid)
+				ORDER BY itemid
+				LIMIT 1
+			) AND
+			grabbed IS NULL -- guard against the race
+			RETURNING itemid
+		`)
+		if err != nil {
+			return nil, err
+		}
+		racecheckstmt, err := conn.Prepare(`
+			SELECT EXISTS (SELECT 1 FROM items WHERE grabbed IS NULL ORDER BY itemid)
+		`)
+		if err != nil {
+			return nil, err
+		}
+		finishstmt, err := conn.Prepare(`
+			UPDATE items
+				SET processed = now()
+			WHERE itemid = $1
+		`)
+		if err != nil {
+			return nil, err
+		}
+		releaselocksstmt, err := conn.Prepare(`
+			SELECT pg_advisory_unlock_all()
+		`)
+
+		numLocksHeld := 0
+		return func(conn *sql.Conn) int {
+			var itemid int
+
+			if numLocksHeld >= 16 {
+				_, err = releaselocksstmt.Exec()
+				if err != nil {
+					panic(err)
+				}
+			}
+			numLocksHeld++
+
+		again:
+			err := grabstmt.QueryRow().Scan(&itemid)
+			if err == sql.ErrNoRows {
+				var notDone bool
+				err = racecheckstmt.QueryRow().Scan(&notDone)
+				if err != nil {
+					panic(err)
+				}
+				if (notDone) {
+					atomic.AddInt64(&numRaces, 1)
+					goto again
+				}
+				return -1
+			} else if err != nil {
+				panic(err)
+			}
+			_, err = finishstmt.Exec(itemid)
+			if err != nil {
+				panic(err)
+			}
+			return itemid
+		}, err
+	}
+}
+
+// Skip locked rows using advisory locks when grabbing an item, but hold the
+// lock for a while longer to try and minimize the number of races.
+// Fixed-length queue version.
+func advisoryLocksFixedLengthQueue() initFunctionType {
+	return func(conn *sql.Conn) (exec func(conn *sql.Conn) int, err error) {
+		grabstmt, err := conn.Prepare(`
+			UPDATE items
+				SET grabbed = now()
+			WHERE itemid = (
+				SELECT itemid
+				FROM
+				(
+					SELECT itemid
+					FROM items
+					WHERE grabbed IS NULL
+					ORDER BY itemid
+					-- maximum supported concurrency
+					LIMIT 32
+				) potential_items
+				WHERE pg_try_advisory_lock(itemid)
+				ORDER BY itemid
+				LIMIT 1
+			) AND
+			grabbed IS NULL -- guard against the race
+			RETURNING itemid
+		`)
+		if err != nil {
+			return nil, err
+		}
+		racecheckstmt, err := conn.Prepare(`
+			SELECT EXISTS (SELECT 1 FROM items WHERE grabbed IS NULL ORDER BY itemid)
+		`)
+		if err != nil {
+			return nil, err
+		}
+		finishstmt, err := conn.Prepare(`
+			UPDATE items
+				SET processed = now()
+			WHERE itemid = $1
+			RETURNING pg_advisory_unlock($2)
+		`)
+		if err != nil {
+			return nil, err
+		}
+
+		itemQueue := make([]int, 16)
+		for i := range itemQueue {
+			itemQueue[i] = -1
+		}
+		itemQueuePos := 0
+
+		return func(conn *sql.Conn) int {
+			var itemid int
+
+		again:
+			err := grabstmt.QueryRow().Scan(&itemid)
+			if err == sql.ErrNoRows {
+				var notDone bool
+				err = racecheckstmt.QueryRow().Scan(&notDone)
+				if err != nil {
+					panic(err)
+				}
+				if (notDone) {
+					atomic.AddInt64(&numRaces, 1)
+					goto again
+				}
+				return -1
+			} else if err != nil {
+				panic(err)
+			}
+			_, err = finishstmt.Exec(itemid, itemQueue[itemQueuePos])
+			if err != nil {
+				panic(err)
+			}
+			itemQueue[itemQueuePos] = itemid
+			itemQueuePos = (itemQueuePos + 1) % 16
+			return itemid
+		}, err
+	}
+}
+
+// Skip locked rows using advisory locks when grabbing an item (the "hold"
+// version); single txn.
 func advisoryLocksSingleTxn() initFunctionType {
 	return func(conn *sql.Conn) (exec func(conn *sql.Conn) int, err error) {
 		grabandmarkstmt, err := conn.Prepare(`
@@ -190,9 +434,9 @@ func advisoryLocksSingleTxn() initFunctionType {
 					WHERE processed IS NULL
 					ORDER BY itemid
 					-- maximum supported concurrency
-					LIMIT 128
+					LIMIT 32
 				) potential_items
-				WHERE pg_try_advisory_xact_lock(itemid)
+				WHERE pg_try_advisory_lock(itemid)
 				ORDER BY itemid
 				LIMIT 1
 			) AND
@@ -208,9 +452,22 @@ func advisoryLocksSingleTxn() initFunctionType {
 		if err != nil {
 			return nil, err
 		}
+		releaselocksstmt, err := conn.Prepare(`
+			SELECT pg_advisory_unlock_all()
+		`)
 
+		processedItemsSinceRelease := 0
 		return func(conn *sql.Conn) int {
 			var itemid int
+
+			if processedItemsSinceRelease >= 10 {
+				_, err = releaselocksstmt.Exec()
+				if err != nil {
+					panic(err)
+				}
+				processedItemsSinceRelease = 0
+			}
+			processedItemsSinceRelease++
 
 			// XXX DO NOT DO THIS IN A REAL APP XXX
 			_, err = conn.Exec(`BEGIN`)
@@ -227,6 +484,7 @@ func advisoryLocksSingleTxn() initFunctionType {
 					panic(err)
 				}
 				if (notDone) {
+					atomic.AddInt64(&numRaces, 1)
 					goto again
 				}
 
@@ -286,7 +544,7 @@ func randomOffset(numConnections int) initFunctionType {
 			var itemid int
 
 		again:
-			err := grabstmt.QueryRow(rand.Intn(numConnections)).Scan(&itemid)
+			err := grabstmt.QueryRow(rand.Intn(numConnections*2)).Scan(&itemid)
 			if err == sql.ErrNoRows {
 				var notDone bool
 				err = racecheckstmt.QueryRow().Scan(&notDone)
@@ -294,6 +552,7 @@ func randomOffset(numConnections int) initFunctionType {
 					panic(err)
 				}
 				if (notDone) {
+					atomic.AddInt64(&numRaces, 1)
 					goto again
 				}
 				return -1
@@ -346,7 +605,7 @@ func randomOffsetSingleTxn(numConnections int) initFunctionType {
 			}
 
 		again:
-			err := grabandmarkstmt.QueryRow(rand.Intn(numConnections)).Scan(&itemid)
+			err := grabandmarkstmt.QueryRow(rand.Intn(numConnections*2)).Scan(&itemid)
 			if err == sql.ErrNoRows {
 				var notDone bool
 				err = racecheckstmt.QueryRow().Scan(&notDone)
@@ -354,6 +613,7 @@ func randomOffsetSingleTxn(numConnections int) initFunctionType {
 					panic(err)
 				}
 				if (notDone) {
+					atomic.AddInt64(&numRaces, 1)
 					goto again
 				}
 
@@ -492,13 +752,16 @@ func initDatabase(numItems int, method string) *sql.DB {
 
 	// method-specific details
 	switch method {
-	case "naiveUpdate", "advisoryLocks", "skipLocked", "randomOffset":
+	case "naiveUpdate", "randomOffset", "skipLocked":
+	case "advisoryLocksNaive", "advisoryLocksRandomOffset":
+	case "advisoryLocksBatchRelease", "advisoryLocksFixedLengthQueue":
 		// nothing to do
-	case "naiveUpdateSingleTxn", "advisoryLocksSingleTxn", "skipLockedSingleTxn", "randomOffsetSingleTxn":
+
+	case "naiveUpdateSingleTxn", "advisoryLocksSingleTxn", "randomOffsetSingleTxn", "skipLockedSingleTxn":
 		noGrabbed = true
 		processedIndex = true
 	default:
-		fmt.Fprintf(os.Stderr, "unrecognized method %s\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unrecognized method %s\n", method)
 		os.Exit(1)
 	}
 
@@ -551,7 +814,7 @@ func main() {
 	var vacuum bool
 
 	if len(os.Args) == 1 {
-		vacuum = true
+		vacuum = false
 	} else if len(os.Args) == 2 {
 		switch os.Args[1] {
 		case "yes":
@@ -567,28 +830,36 @@ func main() {
 		os.Exit(1)
 	}
 
+	if vacuum {
+		fmt.Fprintf(os.Stderr, "vacuum=yes is not supported\n")
+		os.Exit(1)
+	}
+
 	tests := []struct{
 		numConnections int
 		numItems int
 	}{
-		{  1,	100000, },
-		{  2,	250000, },
-		{  4,	300000, },
-		{  6,   300000, },
-		{  8,	300000, },
-		{ 12,	300000, },
-		{ 16,	300000, },
+		{  1,	65000, },
+		{  2,	75000, },
+		{  4,	65000, },
+		{  6,	45000, },
+		{  8,	45000, },
+		{ 12,	45000, },
+		{ 16,	45000, },
 	}
 
 	methods := []string{
-		"naiveUpdate",
-		"naiveUpdateSingleTxn",
-		"advisoryLocks",
+		//"naiveUpdate",
+		//"naiveUpdateSingleTxn",
+		"advisoryLocksNaive",
+		"advisoryLocksRandomOffset",
+		"advisoryLocksBatchRelease",
+		"advisoryLocksFixedLengthQueue",
 		"advisoryLocksSingleTxn",
-		"randomOffset",
-		"randomOffsetSingleTxn",
-		"skipLocked",
-		"skipLockedSingleTxn",
+		//"randomOffset",
+		//"randomOffsetSingleTxn",
+		//"skipLocked",
+		//"skipLockedSingleTxn",
 	}
 
 	p, err := plot.New()
@@ -603,7 +874,7 @@ func main() {
 	p.X.Min = 0.0
 	p.X.Max = 18.0
 	p.Y.Min = 0.0
-	p.Y.Label.Text = "Time to spent per item"
+	p.Y.Label.Text = "Time spent per item"
 
 	var linePoints []interface{}
 	for _, method := range methods {
@@ -643,8 +914,14 @@ func runTest(method string, numItems int, numConnections int, vacuum bool) int64
 		initFunc = naiveUpdate()
 	case "naiveUpdateSingleTxn":
 		initFunc = naiveUpdateSingleTxn()
-	case "advisoryLocks":
-		initFunc = advisoryLocks()
+	case "advisoryLocksNaive":
+		initFunc = advisoryLocksNaive()
+	case "advisoryLocksRandomOffset":
+		initFunc = advisoryLocksRandomOffset(numConnections)
+	case "advisoryLocksBatchRelease":
+		initFunc = advisoryLocksBatchRelease()
+	case "advisoryLocksFixedLengthQueue":
+		initFunc = advisoryLocksFixedLengthQueue()
 	case "advisoryLocksSingleTxn":
 		initFunc = advisoryLocksSingleTxn()
 	case "randomOffset":
@@ -700,11 +977,6 @@ func runTest(method string, numItems int, numConnections int, vacuum bool) int64
 				}
 				b.set(itemid)
 				numItems++
-
-				_, err = conn.Exec("VACUUM items")
-				if err != nil {
-					panic(err)
-				}
 			}
 
 			dataChan <- b
@@ -715,7 +987,10 @@ func runTest(method string, numItems int, numConnections int, vacuum bool) int64
 
 	wg.Wait()
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
+	runtime.GC()
+
+	numRaces = 0
 
 	wg.Add(numConnections)
 	startTimer := time.Now()
@@ -741,7 +1016,7 @@ func runTest(method string, numItems int, numConnections int, vacuum bool) int64
 			fmt.Printf(", ")
 		}
 	}
-	fmt.Printf("\n")
+	fmt.Printf(" (%d races)\n", numRaces)
 
 	diff := endTimer.Sub(startTimer)
 	return diff.Nanoseconds()
