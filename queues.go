@@ -934,7 +934,6 @@ func main() {
 		"naiveUpdate",
 		"naiveUpdateSingleTxn",
 		"advisoryLocksNaive",
-		"advisoryLocksQue",
 		"advisoryLocksHold",
 		"advisoryLocksRandomOffset",
 		"advisoryLocksBatchRelease",
