@@ -542,6 +542,7 @@ func advisoryLocksSingleTxn() initFunctionType {
 		return func(conn *sql.Conn) int {
 			var itemid int
 
+		again:
 			if processedItemsSinceRelease >= 10 {
 				_, err = releaselocksstmt.Exec()
 				if err != nil {
@@ -557,7 +558,6 @@ func advisoryLocksSingleTxn() initFunctionType {
 				panic(err)
 			}
 
-		again:
 			err := grabandmarkstmt.QueryRow().Scan(&itemid)
 			if err == sql.ErrNoRows {
 				var notDone bool
