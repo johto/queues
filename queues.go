@@ -253,6 +253,79 @@ func advisoryLocksNaive() initFunctionType {
 	}
 }
 
+// approach used by https://github.com/chanks/que/blob/master/lib/que/sql.rb
+func advisoryLocksQue() initFunctionType {
+	return func(conn *sql.Conn) (exec func(conn *sql.Conn) int, err error) {
+		grabstmt, err := conn.Prepare(`
+			SELECT itemid
+			FROM
+			(
+				SELECT itemid
+				FROM items
+				WHERE processed IS NULL
+				ORDER BY itemid
+				-- max concurrency
+				LIMIT 32
+			) items
+			WHERE pg_try_advisory_lock(itemid)
+			LIMIT 1
+		`)
+		if err != nil {
+			return nil, err
+		}
+		racecheckstmt, err := conn.Prepare(`
+			SELECT processed IS NULL FROM items WHERE itemid = $1
+		`)
+		if err != nil {
+			return nil, err
+		}
+		releaselockstmt, err := conn.Prepare(`
+			SELECT pg_advisory_unlock($1)
+		`)
+		finishstmt, err := conn.Prepare(`
+			UPDATE items
+				SET processed = now()
+			WHERE itemid = $1
+		`)
+		if err != nil {
+			return nil, err
+		}
+
+		return func(conn *sql.Conn) int {
+			var itemid int
+
+		again:
+			err := grabstmt.QueryRow().Scan(&itemid)
+			if err == sql.ErrNoRows {
+				return -1
+			}
+			var stillAvailable bool
+			err = racecheckstmt.QueryRow(itemid).Scan(&stillAvailable)
+			if err != nil {
+				panic(err)
+			}
+			if (!stillAvailable) {
+				atomic.AddInt64(&numRaces, 1)
+				_, err = releaselockstmt.Exec(itemid)
+				if err != nil {
+					panic(err)
+				}
+				goto again
+			}
+			_, err = finishstmt.Exec(itemid)
+			if err != nil {
+				panic(err)
+			}
+			_, err = releaselockstmt.Exec(itemid)
+			if err != nil {
+				panic(err)
+			}
+			return itemid
+		}, err
+	}
+
+}
+
 // Skip locked rows using advisory locks when grabbing an item, but hold the
 // lock for as long as possible without maintaining state.
 func advisoryLocksHold() initFunctionType {
@@ -839,7 +912,7 @@ func initDatabase(numItems int, method string) *sql.DB {
 	case "advisoryLocksBatchRelease", "advisoryLocksFixedLengthQueue":
 		// nothing to do
 
-	case "naiveUpdateSingleTxn", "advisoryLocksSingleTxn", "randomOffsetSingleTxn", "skipLockedSingleTxn":
+	case "naiveUpdateSingleTxn", "advisoryLocksSingleTxn", "randomOffsetSingleTxn", "skipLockedSingleTxn", "advisoryLocksQue":
 		noGrabbed = true
 		processedIndex = true
 	default:
@@ -999,6 +1072,8 @@ func runTest(method string, numItems int, numConnections int, vacuum bool) int64
 		initFunc = naiveUpdateSingleTxn()
 	case "advisoryLocksNaive":
 		initFunc = advisoryLocksNaive()
+	case "advisoryLocksQue":
+		initFunc = advisoryLocksQue()
 	case "advisoryLocksHold":
 		initFunc = advisoryLocksHold()
 	case "advisoryLocksRandomOffset":
