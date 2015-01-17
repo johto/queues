@@ -282,6 +282,9 @@ func advisoryLocksQue() initFunctionType {
 		releaselockstmt, err := conn.Prepare(`
 			SELECT pg_advisory_unlock($1)
 		`)
+		if err != nil {
+			return nil, err
+		}
 		finishstmt, err := conn.Prepare(`
 			UPDATE items
 				SET processed = now()
@@ -323,7 +326,92 @@ func advisoryLocksQue() initFunctionType {
 			return itemid
 		}, err
 	}
+}
 
+// advisoryLocksQue, but with a stored procedure to reduce the number of
+// round-trips.
+func advisoryLocksQueSP() initFunctionType {
+	return func(conn *sql.Conn) (exec func(conn *sql.Conn) int, err error) {
+		_, err = conn.Exec(`
+			CREATE FUNCTION pg_temp.grab_item() RETURNS int AS $$
+			DECLARE
+				_itemid int;
+			BEGIN
+			LOOP
+				SELECT itemid
+				INTO _itemid
+				FROM
+				(
+					SELECT itemid
+					FROM items
+					WHERE processed IS NULL
+					ORDER BY itemid
+					-- max concurrency
+					LIMIT 32
+				) items
+				WHERE pg_try_advisory_lock(itemid)
+				LIMIT 1;
+				IF NOT FOUND THEN
+					RETURN -1; -- ugly, but I'm lazy
+				END IF;
+
+				-- recheck
+				PERFORM 1
+				FROM items
+				WHERE
+					itemid = _itemid AND
+					processed IS NULL;
+				IF FOUND THEN
+					RETURN _itemid;
+				END IF;
+				-- loopety loop again
+				PERFORM pg_advisory_unlock(_itemid);
+			END LOOP;
+			END
+			$$ LANGUAGE plpgsql;
+		`);
+		if err != nil {
+			return nil, err
+		}
+		grabstmt, err := conn.Prepare(`
+			SELECT pg_temp.grab_item()
+		`)
+		if err != nil {
+			return nil, err
+		}
+		releaselockstmt, err := conn.Prepare(`
+			SELECT pg_advisory_unlock($1)
+		`)
+		if err != nil {
+			return nil, err
+		}
+		finishstmt, err := conn.Prepare(`
+			UPDATE items
+				SET processed = now()
+			WHERE itemid = $1
+		`)
+		if err != nil {
+			return nil, err
+		}
+
+		return func(conn *sql.Conn) int {
+			var itemid int
+
+			err := grabstmt.QueryRow().Scan(&itemid)
+			if err == sql.ErrNoRows {
+				panic("wtf")
+			}
+			_, err = finishstmt.Exec(itemid)
+			if err != nil {
+				panic(err)
+			}
+			_, err = releaselockstmt.Exec(itemid)
+			if err != nil {
+				panic(err)
+			}
+			return itemid
+		}, err
+	}
 }
 
 // Skip locked rows using advisory locks when grabbing an item, but hold the
@@ -921,7 +1009,8 @@ func initDatabase(numItems int, method string) *sql.DB {
 	case "advisoryLocksSingleTxn": fallthrough
 	case "randomOffsetSingleTxn": fallthrough
 	case "skipLockedSingleTxn": fallthrough
-	case "advisoryLocksQue":
+	case "advisoryLocksQue": fallthrough
+	case "advisoryLocksQueSP":
 		noGrabbed = true
 		processedIndex = true
 	default:
@@ -1083,6 +1172,8 @@ func runTest(method string, numItems int, numConnections int, vacuum bool) int64
 		initFunc = advisoryLocksNaive()
 	case "advisoryLocksQue":
 		initFunc = advisoryLocksQue()
+	case "advisoryLocksQueSP":
+		initFunc = advisoryLocksQueSP()
 	case "advisoryLocksHold":
 		initFunc = advisoryLocksHold()
 	case "advisoryLocksRandomOffset":
