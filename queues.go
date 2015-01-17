@@ -301,6 +301,8 @@ func advisoryLocksQue() initFunctionType {
 			err := grabstmt.QueryRow().Scan(&itemid)
 			if err == sql.ErrNoRows {
 				return -1
+			} else if err != nil {
+				panic(err)
 			}
 			var stillAvailable bool
 			err = racecheckstmt.QueryRow(itemid).Scan(&stillAvailable)
@@ -400,6 +402,8 @@ func advisoryLocksQueSP() initFunctionType {
 			err := grabstmt.QueryRow().Scan(&itemid)
 			if err == sql.ErrNoRows {
 				panic("wtf")
+			} else if err != nil {
+				panic(err)
 			}
 			_, err = finishstmt.Exec(itemid)
 			if err != nil {
