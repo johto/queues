@@ -1124,7 +1124,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	p.Title.Text = "Queue performance"
+	p.Title.Text = "Queue performance (lower is better)"
 	p.X.Tick.Marker = func(min, max float64) []plot.Tick {
 		return []plot.Tick{{0,"0"},{1,"1"},{2,"2"},{4,"4"},{6,"6"},{8,"8"},{10,""},{12,"12"},{14,""},{16,"16"}}
 	}
