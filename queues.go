@@ -907,12 +907,21 @@ func initDatabase(numItems int, method string) *sql.DB {
 
 	// method-specific details
 	switch method {
-	case "naiveUpdate", "randomOffset", "skipLocked":
-	case "advisoryLocksNaive", "advisoryLocksHold", "advisoryLocksRandomOffset":
-	case "advisoryLocksBatchRelease", "advisoryLocksFixedLengthQueue":
+	case "naiveUpdate":
+	case "randomOffset":
+	case "skipLocked":
+	case "advisoryLocksNaive":
+	case "advisoryLocksHold":
+	case "advisoryLocksRandomOffset":
+	case "advisoryLocksBatchRelease":
+	case "advisoryLocksFixedLengthQueue":
 		// nothing to do
 
-	case "naiveUpdateSingleTxn", "advisoryLocksSingleTxn", "randomOffsetSingleTxn", "skipLockedSingleTxn", "advisoryLocksQue":
+	case "naiveUpdateSingleTxn": fallthrough
+	case "advisoryLocksSingleTxn": fallthrough
+	case "randomOffsetSingleTxn": fallthrough
+	case "skipLockedSingleTxn": fallthrough
+	case "advisoryLocksQue":
 		noGrabbed = true
 		processedIndex = true
 	default:
